@@ -1,0 +1,222 @@
+V2.3.30.81 - Revert to the latest stable
+
+function importCSVfromDrive() {
+  try {
+    // Folder ID for "Dropzone"
+    const folderId = '1Y8tDGKpwFVVWI-2Dkm7tSSMqDHK6BIey';
+    const folder = DriveApp.getFolderById(folderId);
+    const files = folder.getFilesByType(MimeType.CSV);
+
+    // Open the target sheet by its ID
+    const sheet = SpreadsheetApp.openById('1vDWb4Zj8tP2Z6md9CcbHmm19Rl_bPGydDJw6gURmyaQ').getSheetByName('Sheet1');
+    
+    if (!files.hasNext()) {
+      Logger.log('No CSV files found in the Dropzone folder.');
+      return;
+    }
+
+    while (files.hasNext()) {
+      const file = files.next();
+      try {
+        const csvData = Utilities.parseCsv(file.getBlob().getDataAsString());
+        if (csvData.length > 1) { // Ensure there's data beyond the header
+          appendMappedCSVData(csvData, sheet);
+        } else {
+          Logger.log('CSV file is empty or only contains headers: ' + file.getName());
+        }
+      } catch (fileError) {
+        Logger.log('Error processing file ' + file.getName() + ': ' + fileError.message);
+      }
+    }
+  } catch (error) {
+    Logger.log('Error in importCSVfromDrive: ' + error.message);
+  }
+}
+
+function appendMappedCSVData(csvData, sheet) {
+  try {
+    // Extract the header row from CSV
+    const headers = csvData.shift();
+
+    // Create a mapping from header names to their respective column indexes
+    const headerMap = {};
+    headers.forEach((header, index) => {
+      headerMap[header.trim().toLowerCase()] = index;
+    });
+
+    const lastRow = sheet.getLastRow();
+    const outputData = [];
+
+    // Initialize an object to store the current order details
+    let currentOrder = {
+      order_id: '',
+      outlet_name: '',
+      address: '',
+      province: '',
+      city: '',
+      subdistrict: '',
+      zip: '',
+      email: '',
+      phone: '',
+      status: '',
+      payment_status: '',
+      payment_method: '',
+      created_at: '',
+      paid_at: '',
+      processing_at: '',
+      completed_at: ''
+    };
+
+    // Track the last non-empty values
+    let lastNonEmptyValues = { ...currentOrder };
+    let lastDiscount = '';
+
+    // Track gross revenue for each order_id
+    let grossRevenueMap = {};
+
+    csvData.forEach((row) => {
+      // Update current order details and lastNonEmptyValues if the row has non-empty values
+      Object.keys(currentOrder).forEach(key => {
+        const headerKey = key === 'outlet_name' ? 'name' : key;
+        const value = row[headerMap[headerKey]];
+        
+        if (value !== undefined && value.toString().trim() !== '') {
+          currentOrder[key] = value;
+          lastNonEmptyValues[key] = value;
+        } else {
+          // Use the last non-empty value if current value is empty
+          currentOrder[key] = lastNonEmptyValues[key];
+        }
+      });
+
+      // Extract product details
+      const productString = row[headerMap['product']] || '';
+      const productDetails = extractProductDetails(productString);
+
+      // Calculate gross revenue for each order_id
+      if (currentOrder.order_id) {
+        if (!grossRevenueMap[currentOrder.order_id]) {
+          grossRevenueMap[currentOrder.order_id] = 0;
+        }
+        grossRevenueMap[currentOrder.order_id] += productDetails.price * productDetails.qty;
+      }
+
+      // Create a new row with all the mapped values
+      const mappedRow = [
+        currentOrder.order_id,
+        currentOrder.outlet_name,
+        productDetails.product,
+        productDetails.qty,
+        productDetails.price,
+        '=master_b2b[qty]*master_b2b[price]', // total_price formula as constant string
+        '', // Discount to be calculated later
+        '=master_b2b[total_price]*master_b2b[discount]', // potongan_harga formula as constant string
+        '=master_b2b[total_price]-master_b2b[potongan_harga]', // net_revenue formula as constant string
+        currentOrder.address,
+        currentOrder.province,
+        currentOrder.city,
+        currentOrder.subdistrict,
+        currentOrder.zip,
+        currentOrder.email,
+        currentOrder.phone,
+        currentOrder.status,
+        currentOrder.payment_status,
+        currentOrder.payment_method,
+        convertStringToDate(currentOrder.created_at),
+        convertStringToDate(currentOrder.paid_at),
+        convertStringToDate(currentOrder.processing_at),
+        convertStringToDate(currentOrder.completed_at)
+      ];
+
+      outputData.push(mappedRow);
+    });
+
+    // Calculate discount for each order_id and update the outputData
+    outputData.forEach((row, index) => {
+      const orderId = row[0];
+      if (orderId && grossRevenueMap[orderId]) {
+        const grossRevenue = grossRevenueMap[orderId];
+        const netRevenue = parseFloat(csvData[index][headerMap['net_revenue']].replace(/\./g, '').replace(',', '.'));
+        let discount = ((grossRevenue - netRevenue) / grossRevenue) * 100;
+        if (isNaN(discount)) {
+          discount = lastDiscount;
+        } else {
+          discount = discount.toFixed(2) + '%';
+          lastDiscount = discount;
+        }
+        row[6] = discount;
+      }
+    });
+
+    // Append data to the sheet starting from the first empty row
+    if (outputData.length > 0) {
+      const range = sheet.getRange(lastRow + 1, 1, outputData.length, outputData[0].length);
+      range.setValues(outputData);
+      
+      // Set date format for date columns (assuming columns 20-23 are date columns)
+      const dateColumns = [20, 21, 22, 23]; // Columns T, U, V, W
+      dateColumns.forEach(col => {
+        sheet.getRange(lastRow + 1, col, outputData.length, 1)
+             .setNumberFormat('dd/MM/yyyy HH:mm');
+      });
+    }
+  } catch (error) {
+    Logger.log('Error in appendMappedCSVData: ' + error.message);
+  }
+}
+
+function convertStringToDate(dateString) {
+  try {
+    if (!dateString) return null;
+    
+    // Check if the string matches the expected format "dd-MM-yyyy - HH:mm"
+    const [datePart, timePart] = dateString.split(' - ');
+    if (!datePart || !timePart) return null;
+
+    const [day, month, year] = datePart.split('-').map(Number);
+    const [hours, minutes] = timePart.split(':').map(Number);
+
+    // Create Date object - Note: months are 0-based in JavaScript
+    const date = new Date(year, month - 1, day, hours, minutes);
+    
+    // Validate the date is valid
+    if (isNaN(date.getTime())) return null;
+    
+    return date;
+  } catch (error) {
+    Logger.log('Error in convertStringToDate: ' + error.message);
+    return null;
+  }
+}
+
+function extractProductDetails(productString) {
+  try {
+    // Extract product name, price, and quantity from the product string
+    const productRegex = /^(.*) - ([\d.,]+)\s*\(x(\d+)\)$/;
+    const match = productString.match(productRegex);
+
+    if (match) {
+      const product = match[1].trim();
+      const price = parseFloat(match[2].replace(/\./g, '').replace(',', '.'));
+      const qty = parseInt(match[3]);
+      return { product, price, qty };
+    }
+
+    // Attempt to handle scenarios with more complex product names and formats
+    const complexRegex = /^(.*)\s-\s(\d+[\d.,]*)\)\s*\(x(\d+)\)$/;
+    const complexMatch = productString.match(complexRegex);
+
+    if (complexMatch) {
+      const product = complexMatch[1].trim();
+      const price = parseFloat(complexMatch[2].replace(/\./g, '').replace(',', '.'));
+      const qty = parseInt(complexMatch[3]);
+      return { product, price, qty };
+    }
+
+    // Default return values if the regex does not match
+    return { product: productString, price: 0, qty: 0 };
+  } catch (error) {
+    Logger.log('Error in extractProductDetails: ' + error.message);
+    return { product: productString, price: 0, qty: 0 };
+  }
+}
