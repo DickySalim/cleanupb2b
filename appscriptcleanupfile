@@ -1,52 +1,51 @@
-//V2.4.90
-
 function importCSVfromDrive() {
-  // Folder ID for "Dropzone"
   const folderId = '1Y8tDGKpwFVVWI-2Dkm7tSSMqDHK6BIey';
   const folder = DriveApp.getFolderById(folderId);
   const files = folder.getFilesByType(MimeType.CSV);
 
-  // Open the target sheet by its ID
   const sheet = SpreadsheetApp.openById('1vDWb4Zj8tP2Z6md9CcbHmm19Rl_bPGydDJw6gURmyaQ').getSheetByName('Sheet1');
+  const logSheet = SpreadsheetApp.openById('1vDWb4Zj8tP2Z6md9CcbHmm19Rl_bPGydDJw6gURmyaQ').getSheetByName('log');
+
+  const processedFilesSet = new Set(logSheet.getRange(2, 1, logSheet.getLastRow() - 1, 1).getValues().map(row => row[0]));
 
   if (!files.hasNext()) {
     Logger.log('No CSV files found in the Dropzone folder.');
     return;
   }
 
-  // Load existing data into a Set for efficient lookup
-  const existingRows = sheet.getRange(2, 1, sheet.getLastRow() - 1, sheet.getLastColumn()).getValues();
-  const existingSet = new Set();
-  existingRows.forEach(row => {
-    const key = `${row[0]}|${row[2]}|${row[3]}`;
-    existingSet.add(key);
-  });
-
   while (files.hasNext()) {
     const file = files.next();
+    const fileName = file.getName();
+
+    if (processedFilesSet.has(fileName)) {
+      Logger.log('File already processed: ' + fileName);
+      continue;
+    }
+
     const csvData = Utilities.parseCsv(file.getBlob().getDataAsString());
     if (csvData.length > 1) {
-      appendMappedCSVData(csvData, sheet, existingSet);
+      const { rowsProcessed, rowsAppended, rowsRejected } = appendMappedCSVData(csvData, sheet, fileName);
+
+      logSheet.appendRow([fileName, new Date(), rowsProcessed, rowsAppended, rowsRejected]);
     } else {
-      Logger.log('CSV file is empty or only contains headers: ' + file.getName());
+      Logger.log('CSV file is empty or only contains headers: ' + fileName);
     }
   }
 }
 
-function appendMappedCSVData(csvData, sheet, existingSet) {
-  // Extract the header row from CSV
+function appendMappedCSVData(csvData, sheet, fileName) {
   const headers = csvData.shift();
-
-  // Create a mapping from header names to their respective column indexes
-  const headerMap = {};
-  headers.forEach((header, index) => {
-    headerMap[header.trim().toLowerCase()] = index;
-  });
+  const headerMap = headers.reduce((map, header, index) => {
+    map[header.trim().toLowerCase()] = index;
+    return map;
+  }, {});
 
   const lastRow = sheet.getLastRow();
   const outputData = [];
 
-  // Initialize an object to store the current order details
+  // Define processedOrdersSet to track existing order_id, product, and qty combinations
+  const processedOrdersSet = new Set(sheet.getRange(2, 1, lastRow - 1, 4).getValues().map(row => `${row[0]}|${row[2]}|${row[3]}`));
+
   let currentOrder = {
     order_id: '',
     outlet_name: '',
@@ -66,22 +65,17 @@ function appendMappedCSVData(csvData, sheet, existingSet) {
     completed_at: ''
   };
 
-  // Track the last non-empty values
   let lastNonEmptyValues = { ...currentOrder };
   let lastDiscount = '';
 
-  // Track gross revenue for each order_id
-  let grossRevenueMap = {};
-  let discountMap = {};
+  const grossRevenueMap = {};
 
-  // First pass: Calculate gross revenue and discount for each order_id
-  csvData.forEach((row) => {
-    // Update current order details and lastNonEmptyValues if the row has non-empty values
+  csvData.forEach(row => {
     Object.keys(currentOrder).forEach(key => {
       const headerKey = key === 'outlet_name' ? 'name' : key;
       const value = row[headerMap[headerKey]];
 
-      if (value !== undefined && value.toString().trim() !== '') {
+      if (value && value.trim() !== '') {
         currentOrder[key] = value;
         lastNonEmptyValues[key] = value;
       } else {
@@ -89,27 +83,25 @@ function appendMappedCSVData(csvData, sheet, existingSet) {
       }
     });
 
-    // Extract product details
-    const productString = row[headerMap['product']] || '';
-    const productDetails = extractProductDetails(productString);
+    const productDetails = extractProductDetails(row[headerMap['product']] || '');
 
-    // Calculate gross revenue for each order_id
     if (currentOrder.order_id) {
-      if (!grossRevenueMap[currentOrder.order_id]) {
-        grossRevenueMap[currentOrder.order_id] = 0;
-      }
-      grossRevenueMap[currentOrder.order_id] += productDetails.price * productDetails.qty;
+      grossRevenueMap[currentOrder.order_id] = (grossRevenueMap[currentOrder.order_id] || 0) + productDetails.price * productDetails.qty;
     }
   });
 
-  // Second pass: Create rows and calculate discount
-  csvData.forEach((row) => {
-    // Update current order details and lastNonEmptyValues if the row has non-empty values
+  let rowsProcessed = 0;
+  let rowsAppended = 0;
+  let rowsRejected = 0;
+
+  csvData.forEach(row => {
+    rowsProcessed++;
+
     Object.keys(currentOrder).forEach(key => {
       const headerKey = key === 'outlet_name' ? 'name' : key;
       const value = row[headerMap[headerKey]];
 
-      if (value !== undefined && value.toString().trim() !== '') {
+      if (value && value.trim() !== '') {
         currentOrder[key] = value;
         lastNonEmptyValues[key] = value;
       } else {
@@ -117,25 +109,17 @@ function appendMappedCSVData(csvData, sheet, existingSet) {
       }
     });
 
-    // Extract product details
-    const productString = row[headerMap['product']] || '';
-    const productDetails = extractProductDetails(productString);
+    const productDetails = extractProductDetails(row[headerMap['product']] || '');
 
-    // Calculate discount for the current order_id
     let discount = '';
     if (currentOrder.order_id && grossRevenueMap[currentOrder.order_id]) {
       const grossRevenue = grossRevenueMap[currentOrder.order_id];
       const netRevenue = parseFloat(row[headerMap['net_revenue']].replace(/\./g, '').replace(',', '.'));
       discount = ((grossRevenue - netRevenue) / grossRevenue) * 100;
-      if (isNaN(discount)) {
-        discount = lastDiscount;
-      } else {
-        discount = discount.toFixed(2) + '%';
-        lastDiscount = discount;
-      }
+      discount = isNaN(discount) ? lastDiscount : discount.toFixed(2) + '%';
+      lastDiscount = discount;
     }
 
-    // Create a new row with all the mapped values
     const mappedRow = [
       currentOrder.order_id,
       currentOrder.outlet_name,
@@ -162,64 +146,58 @@ function appendMappedCSVData(csvData, sheet, existingSet) {
       convertStringToDateOnly(currentOrder.completed_at)
     ];
 
-    // Final eligibility check
-    const status = mappedRow[16]; // Status column
+    const status = mappedRow[16];
     const key = `${mappedRow[0]}|${mappedRow[2]}|${mappedRow[3]}`;
 
-    if (status.toLowerCase() === 'completed' && !existingSet.has(key)) {
+    if (status.toLowerCase() === 'completed' && !processedOrdersSet.has(key)) {
       outputData.push(mappedRow);
-      existingSet.add(key);
+      processedOrdersSet.add(key);
+      rowsAppended++;
+    } else {
+      rowsRejected++;
     }
   });
 
-  // Append eligible data to the sheet starting from the first empty row
   if (outputData.length > 0) {
-    const range = sheet.getRange(lastRow + 1, 1, outputData.length, outputData[0].length);
-    range.setValues(outputData);
+    sheet.getRange(lastRow + 1, 1, outputData.length, outputData[0].length).setValues(outputData);
   }
+
+  return {
+    rowsProcessed,
+    rowsAppended,
+    rowsRejected
+  };
 }
 
 function convertStringToDateOnly(dateString) {
   if (!dateString) return null;
-
-  // Check if the string matches the expected format "dd-MM-yyyy - HH:mm"
   const [datePart] = dateString.split(' - ');
   if (!datePart) return null;
-
   const [day, month, year] = datePart.split('-').map(Number);
-
-  // Create Date object - Note: months are 0-based in JavaScript
   const date = new Date(year, month - 1, day);
-
-  // Validate the date is valid
-  if (isNaN(date.getTime())) return null;
-
-  return date;
+  return isNaN(date.getTime()) ? null : date;
 }
 
 function extractProductDetails(productString) {
-  // Extract product name, price, and quantity from the product string
   const productRegex = /^(.*) - ([\d.,]+)\s*\(x(\d+)\)$/;
   const match = productString.match(productRegex);
-
   if (match) {
-    const product = match[1].trim();
-    const price = parseFloat(match[2].replace(/\./g, '').replace(',', '.'));
-    const qty = parseInt(match[3]);
-    return { product, price, qty };
+    return {
+      product: match[1].trim(),
+      price: parseFloat(match[2].replace(/\./g, '').replace(',', '.')),
+      qty: parseInt(match[3])
+    };
   }
 
-  // Attempt to handle scenarios with more complex product names and formats
   const complexRegex = /^(.*)\s-\s(\d+[\d.,]*)\)\s*\(x(\d+)\)$/;
   const complexMatch = productString.match(complexRegex);
-
   if (complexMatch) {
-    const product = complexMatch[1].trim();
-    const price = parseFloat(complexMatch[2].replace(/\./g, '').replace(',', '.'));
-    const qty = parseInt(complexMatch[3]);
-    return { product, price, qty };
+    return {
+      product: complexMatch[1].trim(),
+      price: parseFloat(complexMatch[2].replace(/\./g, '').replace(',', '.')),
+      qty: parseInt(complexMatch[3])
+    };
   }
 
-  // Default return values if the regex does not match
   return { product: productString, price: 0, qty: 0 };
 }
